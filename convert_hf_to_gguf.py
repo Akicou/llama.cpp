@@ -5555,6 +5555,82 @@ class Qwen3_5MoeTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
     model_arch = gguf.MODEL_ARCH.QWEN35MOE
 
 
+@ModelBase.register("QuasarForCausalLM")
+class QuasarTextModel(_LinearAttentionVReorderBase):
+    model_arch = gguf.MODEL_ARCH.QUASAR
+
+    def set_vocab(self):
+        # The checkpoint declares a custom TokenizersBackend class, but the
+        # tokenizer.json itself is a standard Qwen3.5 BPE tokenizer.
+        with open(self.dir_model / "tokenizer.json", "r", encoding="utf-8") as f:
+            tokenizer_json = json.load(f)
+
+        vocab: dict[str, int] = tokenizer_json["model"]["vocab"]
+        added_tokens = tokenizer_json.get("added_tokens", [])
+        added_vocab = {tok["content"]: int(tok["id"]) for tok in added_tokens}
+        added_special = {int(tok["id"]): bool(tok.get("special", False)) for tok in added_tokens}
+        reverse_vocab = {id_: tok for tok, id_ in {**vocab, **added_vocab}.items()}
+
+        vocab_size = self.hparams["vocab_size"]
+        tokens: list[str] = []
+        toktypes: list[int] = []
+        for i in range(vocab_size):
+            token = reverse_vocab.get(i)
+            if token is None:
+                tokens.append(f"[PAD{i}]")
+                toktypes.append(gguf.TokenType.UNUSED)
+            elif i in added_special:
+                tokens.append(token)
+                toktypes.append(gguf.TokenType.CONTROL if added_special[i] or self.does_token_look_special(token) else gguf.TokenType.USER_DEFINED)
+            else:
+                tokens.append(token)
+                toktypes.append(gguf.TokenType.NORMAL)
+
+        self.gguf_writer.add_tokenizer_model("gpt2")
+        self.gguf_writer.add_tokenizer_pre("qwen35")
+        self.gguf_writer.add_token_list(tokens)
+        self.gguf_writer.add_token_types(toktypes)
+
+        special_vocab = gguf.SpecialVocab(self.dir_model, load_merges=True)
+        special_vocab.add_to_gguf(self.gguf_writer)
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        if bid is not None and ".self_attn.gla." in name:
+            if name.endswith(".self_attn.gla.q_proj.weight"):
+                yield (self.format_tensor_name(gguf.MODEL_TENSOR.ATTN_Q, bid, ".weight"), data_torch)
+                return
+            if name.endswith(".self_attn.gla.k_proj.weight"):
+                yield (self.format_tensor_name(gguf.MODEL_TENSOR.ATTN_K, bid, ".weight"), data_torch)
+                return
+            if name.endswith(".self_attn.gla.v_proj.weight"):
+                yield (self.format_tensor_name(gguf.MODEL_TENSOR.ATTN_V, bid, ".weight"), data_torch)
+                return
+            if name.endswith(".self_attn.gla.g_proj.weight"):
+                yield (self.format_tensor_name(gguf.MODEL_TENSOR.ATTN_GATE, bid, ".weight"), data_torch)
+                return
+            if name.endswith(".self_attn.gla.o_proj.weight"):
+                yield (self.format_tensor_name(gguf.MODEL_TENSOR.ATTN_OUT, bid, ".weight"), data_torch)
+                return
+            if name.endswith(".self_attn.gla.g_norm_swish_gate.weight"):
+                yield (self.format_tensor_name(gguf.MODEL_TENSOR.SSM_NORM, bid, ".weight"), data_torch)
+                return
+            if name.endswith(".self_attn.gla.gk_proj.0.weight"):
+                yield (self.format_tensor_name(gguf.MODEL_TENSOR.SSM_F_A, bid, ".weight"), data_torch)
+                return
+            if name.endswith(".self_attn.gla.gk_proj.1.weight"):
+                yield (self.format_tensor_name(gguf.MODEL_TENSOR.SSM_F_B, bid, ".weight"), data_torch)
+                return
+            if name.endswith(".self_attn.gla.gk_proj.1.bias"):
+                yield (self.format_tensor_name(gguf.MODEL_TENSOR.SSM_DT, bid, ".bias"), data_torch)
+                return
+
+            raise ValueError(f"Unexpected Quasar GLA tensor: {name}")
+
+        # Let the Qwen3.5 linear-attention path handle A_log, dt_bias, conv1d
+        # squeezing, V-head reordering and standard name mapping.
+        yield from _LinearAttentionVReorderBase.modify_tensors(self, data_torch, name, bid)
+
+
 # MiniCPM-V 4.6: text tower is Qwen3.5 (linear+full hybrid attention) wrapped under
 # `model.language_model.*`; vision tower is SigLIP + a window-attention ViT merger
 # + a final DownsampleMLP merger. The same HF arch is registered twice below: once as
